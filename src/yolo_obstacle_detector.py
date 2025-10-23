@@ -18,6 +18,13 @@ except ImportError:
     YOLO_AVAILABLE = False
     print("⚠️ ultralytics not available, YOLOv8-seg功能不可用")
 
+try:
+    import onnxruntime as ort
+    ONNX_AVAILABLE = True
+except ImportError:
+    ONNX_AVAILABLE = False
+    print("⚠️ onnxruntime not available, ONNX模型功能不可用")
+
 class YOLOObstacleDetector:
     """
     YOLOv8分割障碍物检测器
@@ -98,12 +105,12 @@ class YOLOObstacleDetector:
         Returns:
             量化模型路径
         """
-        quantized_models_dir = "quantized_models"
+        quantized_models_dir = "src/quantized_models"
         
         if quantization_type == "fp16":
             # 优先选择ONNX格式，其次OpenVINO
             onnx_path = os.path.join(quantized_models_dir, "yolov8n-seg_fp16.onnx")
-            onnx_fallback = "yolov8n-seg.onnx"  # 导出的ONNX文件
+            onnx_fallback = "src/yolov8n-seg.onnx"  # 导出的ONNX文件
             openvino_path = os.path.join(quantized_models_dir, "yolov8n-seg_fp16")
             
             if os.path.exists(onnx_path):
@@ -257,30 +264,144 @@ class YOLOObstacleDetector:
     
     def _initialize_model(self):
         """
-        初始化YOLOv8模型
+        初始化YOLOv8模型（支持PyTorch和ONNX格式）
         """
         try:
             print(f"🔄 加载YOLOv8分割模型: {self.model_path}")
-            self.model = YOLO(self.model_path)
             
-            # 设置设备
-            if self.device == "auto":
-                self.device = "cuda" if self.model.device.type == "cuda" else "cpu"
+            # 检查是否为ONNX模型
+            if self.model_path.endswith('.onnx'):
+                if not ONNX_AVAILABLE:
+                    print("❌ ONNX Runtime不可用，无法加载ONNX模型")
+                    self.is_initialized = False
+                    return
+                
+                # 加载ONNX模型
+                self.model = self._load_onnx_model()
+                self.model_type = "onnx"
+                
+            else:
+                # 加载PyTorch模型
+                self.model = YOLO(self.model_path)
+                self.model_type = "pytorch"
+                
+                # 设置设备
+                if self.device == "auto":
+                    self.device = "cuda" if self.model.device.type == "cuda" else "cpu"
             
-            print(f"✅ YOLOv8模型加载成功")
+            print(f"✅ YOLOv8模型加载成功 ({self.model_type})")
             print(f"   设备: {self.device}")
             print(f"   置信度阈值: {self.confidence_threshold}")
             print(f"   障碍物类别数: {len(self.obstacle_class_names)}")
-            print(f"   模型自带类别: {len(self.model.names)} 个")
             
-            # 显示模型支持的所有类别
-            print(f"   模型支持的类别: {list(self.model.names.values())}")
+            if self.model_type == "pytorch":
+                print(f"   模型自带类别: {len(self.model.names)} 个")
+                print(f"   模型支持的类别: {list(self.model.names.values())}")
             
             self.is_initialized = True
             
         except Exception as e:
             print(f"❌ YOLOv8模型初始化失败: {e}")
             self.is_initialized = False
+    
+    def _load_onnx_model(self):
+        """
+        加载ONNX模型
+        """
+        try:
+            # 设置ONNX Runtime提供者
+            providers = ['CPUExecutionProvider']
+            if self.device == "cuda":
+                providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+            
+            # 创建ONNX Runtime会话
+            session = ort.InferenceSession(self.model_path, providers=providers)
+            
+            # 获取输入输出信息
+            input_info = session.get_inputs()[0]
+            output_info = session.get_outputs()
+            
+            print(f"   ONNX模型输入: {input_info.name}, 形状: {input_info.shape}")
+            print(f"   ONNX模型输出数量: {len(output_info)}")
+            
+            # 创建模型包装器
+            model_wrapper = {
+                'session': session,
+                'input_name': input_info.name,
+                'input_shape': input_info.shape,
+                'output_names': [output.name for output in output_info],
+                'names': {i: f'class_{i}' for i in range(80)}  # COCO数据集80个类别
+            }
+            
+            return model_wrapper
+            
+        except Exception as e:
+            print(f"❌ ONNX模型加载失败: {e}")
+            raise e
+    
+    def _run_onnx_inference(self, image: np.ndarray):
+        """
+        运行ONNX模型推理
+        """
+        try:
+            # 预处理图像
+            input_tensor = self._preprocess_image_for_onnx(image)
+            
+            # 运行推理
+            outputs = self.model['session'].run(
+                self.model['output_names'], 
+                {self.model['input_name']: input_tensor}
+            )
+            
+            # 后处理结果
+            results = self._postprocess_onnx_outputs(outputs, image.shape)
+            
+            return results
+            
+        except Exception as e:
+            print(f"❌ ONNX推理失败: {e}")
+            return None
+    
+    def _preprocess_image_for_onnx(self, image: np.ndarray) -> np.ndarray:
+        """
+        为ONNX模型预处理图像
+        """
+        # 调整图像大小到模型输入尺寸
+        input_size = 640  # YOLOv8默认输入尺寸
+        resized = cv.resize(image, (input_size, input_size))
+        
+        # 转换为RGB
+        rgb = cv.cvtColor(resized, cv.COLOR_BGR2RGB)
+        
+        # 归一化到[0,1]
+        normalized = rgb.astype(np.float32) / 255.0
+        
+        # 转换为CHW格式并添加batch维度
+        input_tensor = np.transpose(normalized, (2, 0, 1))
+        input_tensor = np.expand_dims(input_tensor, axis=0)
+        
+        return input_tensor
+    
+    def _postprocess_onnx_outputs(self, outputs, original_shape):
+        """
+        后处理ONNX模型输出
+        """
+        # 这里需要根据YOLOv8-seg的ONNX输出格式进行后处理
+        # 由于ONNX输出格式复杂，这里先返回一个简单的包装器
+        # 实际应用中需要根据具体的ONNX模型输出格式进行解析
+        
+        class ONNXResult:
+            def __init__(self, outputs, original_shape):
+                self.outputs = outputs
+                self.original_shape = original_shape
+                self.masks = None  # 分割掩膜
+                self.boxes = None  # 边界框
+                self.names = {i: f'class_{i}' for i in range(80)}
+            
+            def __iter__(self):
+                return iter([self])
+        
+        return ONNXResult(outputs, original_shape)
     
     def detect_obstacles(self, 
                         image: np.ndarray, 
@@ -301,11 +422,15 @@ class YOLOObstacleDetector:
         start_time = time.time()
         
         try:
-            # YOLOv8推理
-            results = self.model(image, 
-                               conf=self.confidence_threshold,
-                               device=self.device,
-                               verbose=False)
+            # 根据模型类型进行推理
+            if self.model_type == "onnx":
+                results = self._run_onnx_inference(image)
+            else:
+                # PyTorch模型推理
+                results = self.model(image, 
+                                   conf=self.confidence_threshold,
+                                   device=self.device,
+                                   verbose=False)
             
             inference_time = time.time() - start_time
             self.inference_times.append(inference_time)

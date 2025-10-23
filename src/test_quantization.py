@@ -14,7 +14,7 @@ def create_test_image(width: int = 640, height: int = 640) -> np.ndarray:
     """创建测试图像"""
     # 创建一个包含各种形状的测试图像
     image = np.zeros((height, width, 3), dtype=np.uint8)
-    
+    cv2.circle(image, (320, 320), 100, (255, 255, 255), -1)
     # 添加一些几何形状模拟障碍物
     cv2.rectangle(image, (100, 100), (200, 200), (255, 0, 0), -1)  # 蓝色矩形
     cv2.circle(image, (400, 300), 80, (0, 255, 0), -1)  # 绿色圆形

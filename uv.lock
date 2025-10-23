@@ -2211,7 +2211,7 @@ requires-dist = [
     { name = "click", specifier = ">=8.0.0" },
     { name = "flake8", marker = "extra == 'dev'", specifier = ">=5.0.0" },
     { name = "isort", marker = "extra == 'dev'", specifier = ">=5.10.0" },
-    { name = "mediapipe", specifier = ">=0.10.0,<0.11.0" },
+    { name = "mediapipe", specifier = ">=0.10.18,<0.11.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.0.0" },
     { name = "numpy", specifier = ">=1.24.0" },
     { name = "onnx", specifier = ">=1.17.0" },

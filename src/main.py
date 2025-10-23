@@ -1037,7 +1037,7 @@ def main():
         contact_threshold=0.03,  # 3cm触碰阈值（更合理的阈值）
         warning_threshold=0.06,  # 6cm警告阈值（更合理的阈值）
         use_yolo_obstacle=True,  # 使用YOLOv8障碍物检测
-        yolo_model_path="yolov8n-seg.onnx"  # 使用量化后的ONNX模型
+        yolo_model_path="src/yolov8n-seg.onnx"  # 使用量化后的ONNX模型
     )
     
     print("📋 使用说明：")
