@@ -400,6 +400,13 @@ class YOLOObstacleDetector:
             
             def __iter__(self):
                 return iter([self])
+            
+            def __getitem__(self, index):
+                # 支持索引访问，返回自身
+                if index == 0:
+                    return self
+                else:
+                    raise IndexError("ONNXResult only supports index 0")
         
         return ONNXResult(outputs, original_shape)
     
