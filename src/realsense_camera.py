@@ -3,19 +3,11 @@
 RealSense相机管理模块
 支持RealSense深度相机和普通摄像头
 """
-
 import cv2 as cv
 import numpy as np
 from typing import Tuple, Optional, Dict, Any
 import time
-
-try:
-    import pyrealsense2 as rs
-    REALSENSE_AVAILABLE = True
-except ImportError:
-    REALSENSE_AVAILABLE = False
-    print("⚠️ pyrealsense2 not available, using mock camera")
-
+import pyrealsense2 as rs
 class RealSenseCamera:
     """
     RealSense深度相机管理类
@@ -68,9 +60,7 @@ class RealSenseCamera:
             
             self.is_running = True
             print(f"✅ RealSense相机启动成功")
-            print(f"   分辨率: {self.width}x{self.height}")
-            print(f"   帧率: {self.fps}")
-            print(f"   深度比例: {self.depth_scale}")
+           
             
             return True
             
@@ -180,170 +170,24 @@ class RealSenseCamera:
             print("✅ RealSense相机已停止")
 
 
-class MockCamera:
-    """
-    模拟相机类（使用普通摄像头）
-    """
-    
-    def __init__(self, camera_index: int = 0, width: int = 640, height: int = 480):
-        """
-        初始化模拟相机
-        
-        Args:
-            camera_index: 摄像头索引
-            width: 图像宽度
-            height: 图像高度
-        """
-        self.camera_index = camera_index
-        self.width = width
-        self.height = height
-        
-        # 初始化摄像头
-        self.cap = cv.VideoCapture(camera_index)
-        
-        if self.cap.isOpened():
-            # 设置分辨率
-            self.cap.set(cv.CAP_PROP_FRAME_WIDTH, width)
-            self.cap.set(cv.CAP_PROP_FRAME_HEIGHT, height)
-            
-            # 设置帧率
-            self.cap.set(cv.CAP_PROP_FPS, 30)
-            
-            self.is_running = True
-            print(f"✅ 模拟相机启动成功 (摄像头 {camera_index})")
-            print(f"   分辨率: {width}x{height}")
-        else:
-            self.is_running = False
-            print(f"❌ 无法打开摄像头 {camera_index}")
-    
-    def get_frames(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        """
-        获取深度帧和彩色帧（模拟版本）
-        
-        Returns:
-            Tuple[深度帧, 彩色帧]: 模拟深度图和彩色图
-        """
-        if not self.is_running:
-            return None, None
-            
-        ret, color_image = self.cap.read()
-        if not ret:
-            return None, None
-        
-        # 调整图像大小
-        color_image = cv.resize(color_image, (self.width, self.height))
-        
-        # 创建模拟深度图（基于图像亮度）
-        gray = cv.cvtColor(color_image, cv.COLOR_BGR2GRAY)
-        
-        # 简单的深度模拟：基于亮度反比
-        # 较暗的区域假设更近，较亮的区域假设更远
-        depth_image = (255 - gray).astype(np.float32) / 255.0
-        
-        # 添加一些随机噪声使深度图更真实
-        noise = np.random.normal(0, 0.05, depth_image.shape)
-        depth_image = np.clip(depth_image + noise, 0.1, 2.0)
-        
-        return depth_image, color_image
-    
-    def create_depth_visualization(self, depth_image: np.ndarray) -> np.ndarray:
-        """
-        创建深度图可视化（模拟版本）
-        
-        Args:
-            depth_image: 深度图像(米)
-            
-        Returns:
-            np.ndarray: 彩色深度图
-        """
-        if depth_image is None:
-            return np.zeros((self.height, self.width, 3), dtype=np.uint8)
-        
-        # 将深度图转换为0-255范围
-        if depth_image.max() > depth_image.min():
-            depth_normalized = ((depth_image - depth_image.min()) / 
-                               (depth_image.max() - depth_image.min()) * 255).astype(np.uint8)
-        else:
-            depth_normalized = np.zeros_like(depth_image, dtype=np.uint8)
-        
-        # 应用颜色映射
-        depth_colored = cv.applyColorMap(depth_normalized, cv.COLORMAP_JET)
-        
-        return depth_colored
-    
-    def get_camera_info(self) -> Dict[str, Any]:
-        """
-        获取相机信息
-        
-        Returns:
-            Dict: 相机信息
-        """
-        return {
-            'type': 'Mock',
-            'camera_index': self.camera_index,
-            'width': self.width,
-            'height': self.height,
-            'is_running': self.is_running
-        }
-    
-    def is_available(self) -> bool:
-        """
-        检查相机是否可用
-        
-        Returns:
-            bool: 相机是否可用
-        """
-        return self.is_running and self.cap.isOpened()
-    
-    def cleanup(self):
-        """
-        清理资源
-        """
-        if self.cap.isOpened():
-            self.cap.release()
-            self.is_running = False
-            print("✅ 模拟相机已停止")
 
 
-def create_camera(camera_type: str = "auto", **kwargs) -> Any:
+
+def create_camera(**kwargs) -> Any:
     """
-    相机工厂函数
+    相机工厂函数（仅RealSense）
     
     Args:
-        camera_type: 相机类型 ("realsense", "mock", "auto")
-        **kwargs: 其他参数
+        **kwargs: RealSense 初始化参数（如 width, height, fps）
         
     Returns:
-        相机对象
+        相机对象（RealSenseCamera）
     """
-    if camera_type == "realsense":
-        if not REALSENSE_AVAILABLE:
-            print("⚠️ RealSense不可用，使用模拟相机")
-            return MockCamera(**kwargs)
-        
-        camera = RealSenseCamera(**kwargs)
-        if camera.start():
-            return camera
-        else:
-            print("⚠️ RealSense启动失败，使用模拟相机")
-            return MockCamera(**kwargs)
-    
-    elif camera_type == "mock":
-        return MockCamera(**kwargs)
-    
-    elif camera_type == "auto":
-        # 自动选择：优先尝试RealSense
-        if REALSENSE_AVAILABLE:
-            camera = RealSenseCamera(**kwargs)
-            if camera.start():
-                return camera
-        
-        # RealSense不可用或启动失败，使用模拟相机
-        print("🔄 自动切换到模拟相机")
-        return MockCamera(**kwargs)
-    
-    else:
-        raise ValueError(f"不支持的相机类型: {camera_type}")
+ 
+    camera = RealSenseCamera(**kwargs)
+    if camera.start():
+        return camera
+    raise RuntimeError("Failed to start RealSense camera")
 
 
 def main():
@@ -352,8 +196,8 @@ def main():
     """
     print("🚀 测试相机功能...")
     
-    # 创建相机
-    camera = create_camera("auto")
+    # 创建相机（仅RealSense）
+    camera = create_camera()
     
     if not camera.is_available():
         print("❌ 相机不可用")

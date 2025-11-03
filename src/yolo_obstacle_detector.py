@@ -10,20 +10,31 @@ from typing import List, Tuple, Optional, Dict, Any
 import time
 import os
 import torch
+from ultralytics import YOLO
+import logging
 
-try:
-    from ultralytics import YOLO
-    YOLO_AVAILABLE = True
-except ImportError:
-    YOLO_AVAILABLE = False
-    print("⚠️ ultralytics not available, YOLOv8-seg功能不可用")
+logger = logging.getLogger(__name__)
+import onnxruntime as ort
+ 
+# 稳定的检测结果类型别名，避免外部依赖内部结构细节
+DetectionResult = Dict[str, Any]
 
-try:
-    import onnxruntime as ort
-    ONNX_AVAILABLE = True
-except ImportError:
-    ONNX_AVAILABLE = False
-    print("⚠️ onnxruntime not available, ONNX模型功能不可用")
+# 轻量级的ONNX结果包装，提供与Ultralytics结果最小一致的接口
+class _ONNXResult:
+    def __init__(self, outputs, original_shape):
+        self.outputs = outputs
+        self.original_shape = original_shape
+        self.masks = None  # 分割掩膜占位
+        self.boxes = None  # 边界框占位
+        self.names = {i: f'class_{i}' for i in range(80)}
+
+    def __iter__(self):
+        return iter([self])
+
+    def __getitem__(self, index):
+        if index == 0:
+            return self
+        raise IndexError("ONNXResult only supports index 0")
 
 class YOLOObstacleDetector:
     """
@@ -57,34 +68,9 @@ class YOLOObstacleDetector:
         if use_quantized:
             self.model_path = self._get_quantized_model_path(quantization_type)
         
-        # 障碍物类别（使用YOLOv8模型自带的类别名称）
-        # 这些是COCO数据集的80个类别，YOLOv8会自动识别
-        self.obstacle_class_names = {
-            # 家具类
-            'chair', 'couch', 'bed', 'dining table', 'toilet',
-            'tv', 'laptop', 'mouse', 'remote', 'keyboard',
-            'cell phone', 'microwave', 'oven', 'toaster',
-            'sink', 'refrigerator', 'book', 'clock', 'vase',
-            'scissors', 'teddy bear', 'hair drier', 'toothbrush',
-            
-            # 交通工具类
-            'car', 'motorcycle', 'airplane', 'bus', 'train',
-            'truck', 'boat', 'bicycle',
-            
-            # 其他物体
-            'bottle', 'wine glass', 'cup', 'fork', 'knife',
-            'spoon', 'bowl', 'banana', 'apple', 'sandwich',
-            'orange', 'broccoli', 'carrot', 'hot dog',
-            'pizza', 'donut', 'cake',
-            
-            # 运动用品
-            'sports ball', 'tennis racket',
-        }
-        
-        # 手部相关类别（需要排除）
-        self.hand_related_class_names = {
-            'person',  # 人体，包含手部
-        }
+        # 动态类别ID集合（初始化后根据模型类别填充）
+        self.obstacle_class_ids = set()
+        self.hand_class_ids = set()
         
         self.model = None
         self.is_initialized = False
@@ -116,12 +102,12 @@ class YOLOObstacleDetector:
             if os.path.exists(onnx_path):
                 return onnx_path
             elif os.path.exists(onnx_fallback):
-                print(f"📦 使用导出的ONNX模型: {onnx_fallback}")
+                logger.info(f"Use exported ONNX model: {onnx_fallback}")
                 return onnx_fallback
             elif os.path.exists(openvino_path):
                 return openvino_path
             else:
-                print(f"⚠️  FP16量化模型不存在，使用原始模型")
+                logger.warning("FP16 quantized model not found, using original .pt model")
                 return "yolov8n-seg.pt"
                 
         elif quantization_type == "int8":
@@ -134,46 +120,64 @@ class YOLOObstacleDetector:
             elif os.path.exists(openvino_path):
                 return openvino_path
             else:
-                print(f"⚠️  INT8量化模型不存在，使用FP16模型")
+                logger.warning("INT8 quantized model not found, falling back to FP16")
                 return self._get_quantized_model_path("fp16")
                 
         else:
             return "yolov8n-seg.pt"
     
     def _initialize_model(self):
-        """初始化YOLOv8模型"""
+        """
+        初始化YOLOv8模型（支持PyTorch和ONNX格式）
+        """
         try:
-            if not YOLO_AVAILABLE:
-                print("❌ ultralytics不可用，无法初始化YOLOv8模型")
-                return
+            logger.info(f"Loading YOLOv8 segmentation model: {self.model_path}")
             
-            print(f"🔄 加载YOLOv8模型: {self.model_path}")
-            print(f"   量化类型: {self.quantization_type}")
-            print(f"   设备: {self.device}")
-            
-            # 加载模型（修复PyTorch 2.6的weights_only问题）
-            try:
+            # 检查是否为ONNX模型
+            if self.model_path.endswith('.onnx'):
+                # 加载ONNX模型
+                self.model = self._load_onnx_model()
+                self.model_type = "onnx"
+                
+            else:
+                # 加载PyTorch模型
                 self.model = YOLO(self.model_path)
-            except Exception as e:
-                if "weights_only" in str(e):
-                    # 对于.pt文件，使用weights_only=False
-                    import torch
-                    torch.serialization.add_safe_globals(['ultralytics.nn.tasks.SegmentationModel'])
-                    self.model = YOLO(self.model_path)
-                else:
-                    raise e
+                self.model_type = "pytorch"
+                
+                # 设置设备
+                if self.device == "auto":
+                    self.device = "cuda" if self.model.device.type == "cuda" else "cpu"
             
-            # 设置设备
-            if self.device == "auto":
-                self.device = "cuda" if torch.cuda.is_available() else "cpu"
+            logger.info(f"YOLOv8 model loaded successfully ({self.model_type})")
+            logger.info(f"Device: {self.device}")
+            logger.info(f"Confidence threshold: {self.confidence_threshold}")
+
+            # 动态读取类别并建立障碍物/手部类别ID集合
+            try:
+                if self.model_type == "onnx":
+                    names_map = self.model['names']
+                else:
+                    names_map = self.model.names
+
+                # 排除人类（手部）类别，其余一律判为障碍物
+                self.hand_class_ids = {i for i, n in names_map.items() if n == 'person'}
+                self.obstacle_class_ids = set(names_map.keys()) - self.hand_class_ids
+
+                logger.info(f"Num classes: {len(names_map)}")
+                if self.hand_class_ids:
+                    logger.info(f"Hand-related class IDs: {sorted(list(self.hand_class_ids))}")
+                logger.info(f"Obstacle class ID count: {len(self.obstacle_class_ids)}")
+            except Exception as _:
+                # 回退策略：未知类别名时，将全部视为障碍物
+                self.hand_class_ids = set()
+                # 若无法获取类别总数，则不打印细节
+                logger.warning("Class names unavailable, treating all classes as obstacles by default")
             
             self.is_initialized = True
-            print(f"✅ YOLOv8模型加载成功")
             
         except Exception as e:
-            print(f"❌ YOLOv8模型加载失败: {e}")
+            logger.error(f"YOLOv8 model initialization failed: {e}")
             self.is_initialized = False
-            print("❌ YOLOv8不可用，请安装ultralytics: pip install ultralytics")
     
     def get_model_info(self) -> Dict[str, Any]:
         """
@@ -212,97 +216,7 @@ class YOLOObstacleDetector:
         except:
             return "Unknown"
     
-    def benchmark_performance(self, test_image: np.ndarray, num_runs: int = 20) -> Dict[str, float]:
-        """
-        性能基准测试
-        
-        Args:
-            test_image: 测试图像
-            num_runs: 测试次数
-            
-        Returns:
-            性能测试结果
-        """
-        if not self.is_initialized:
-            return {"error": "模型未初始化"}
-        
-        print(f"🔄 开始性能基准测试 ({num_runs}次运行)...")
-        
-        # 预热
-        for _ in range(5):
-            _ = self.model(test_image, verbose=False)
-        
-        # 性能测试
-        times = []
-        for i in range(num_runs):
-            start_time = time.time()
-            _ = self.model(test_image, verbose=False)
-            inference_time = time.time() - start_time
-            times.append(inference_time)
-            
-            if (i + 1) % 5 == 0:
-                print(f"   完成 {i + 1}/{num_runs} 次测试")
-        
-        avg_time = np.mean(times)
-        std_time = np.std(times)
-        fps = 1.0 / avg_time
-        
-        results = {
-            "average_time": avg_time,
-            "std_time": std_time,
-            "fps": fps,
-            "min_time": np.min(times),
-            "max_time": np.max(times)
-        }
-        
-        print(f"✅ 性能测试完成:")
-        print(f"   平均推理时间: {avg_time:.4f}s ± {std_time:.4f}s")
-        print(f"   FPS: {fps:.2f}")
-        print(f"   最小/最大时间: {np.min(times):.4f}s / {np.max(times):.4f}s")
-        
-        return results
     
-    def _initialize_model(self):
-        """
-        初始化YOLOv8模型（支持PyTorch和ONNX格式）
-        """
-        try:
-            print(f"🔄 加载YOLOv8分割模型: {self.model_path}")
-            
-            # 检查是否为ONNX模型
-            if self.model_path.endswith('.onnx'):
-                if not ONNX_AVAILABLE:
-                    print("❌ ONNX Runtime不可用，无法加载ONNX模型")
-                    self.is_initialized = False
-                    return
-                
-                # 加载ONNX模型
-                self.model = self._load_onnx_model()
-                self.model_type = "onnx"
-                
-            else:
-                # 加载PyTorch模型
-                self.model = YOLO(self.model_path)
-                self.model_type = "pytorch"
-                
-                # 设置设备
-                if self.device == "auto":
-                    self.device = "cuda" if self.model.device.type == "cuda" else "cpu"
-            
-            print(f"✅ YOLOv8模型加载成功 ({self.model_type})")
-            print(f"   设备: {self.device}")
-            print(f"   置信度阈值: {self.confidence_threshold}")
-            print(f"   障碍物类别数: {len(self.obstacle_class_names)}")
-            
-            if self.model_type == "pytorch":
-                print(f"   模型自带类别: {len(self.model.names)} 个")
-                print(f"   模型支持的类别: {list(self.model.names.values())}")
-            
-            self.is_initialized = True
-            
-        except Exception as e:
-            print(f"❌ YOLOv8模型初始化失败: {e}")
-            self.is_initialized = False
     
     def _load_onnx_model(self):
         """
@@ -321,8 +235,8 @@ class YOLOObstacleDetector:
             input_info = session.get_inputs()[0]
             output_info = session.get_outputs()
             
-            print(f"   ONNX模型输入: {input_info.name}, 形状: {input_info.shape}")
-            print(f"   ONNX模型输出数量: {len(output_info)}")
+            logger.info(f"ONNX input: {input_info.name}, shape: {input_info.shape}")
+            logger.info(f"ONNX outputs: {len(output_info)}")
             
             # 创建模型包装器
             model_wrapper = {
@@ -336,7 +250,7 @@ class YOLOObstacleDetector:
             return model_wrapper
             
         except Exception as e:
-            print(f"❌ ONNX模型加载失败: {e}")
+            logger.error(f"ONNX model load failed: {e}")
             raise e
     
     def _run_onnx_inference(self, image: np.ndarray):
@@ -359,7 +273,7 @@ class YOLOObstacleDetector:
             return results
             
         except Exception as e:
-            print(f"❌ ONNX推理失败: {e}")
+            logger.error(f"ONNX inference failed: {e}")
             return None
     
     def _preprocess_image_for_onnx(self, image: np.ndarray) -> np.ndarray:
@@ -389,30 +303,11 @@ class YOLOObstacleDetector:
         # 这里需要根据YOLOv8-seg的ONNX输出格式进行后处理
         # 由于ONNX输出格式复杂，这里先返回一个简单的包装器
         # 实际应用中需要根据具体的ONNX模型输出格式进行解析
-        
-        class ONNXResult:
-            def __init__(self, outputs, original_shape):
-                self.outputs = outputs
-                self.original_shape = original_shape
-                self.masks = None  # 分割掩膜
-                self.boxes = None  # 边界框
-                self.names = {i: f'class_{i}' for i in range(80)}
-            
-            def __iter__(self):
-                return iter([self])
-            
-            def __getitem__(self, index):
-                # 支持索引访问，返回自身
-                if index == 0:
-                    return self
-                else:
-                    raise IndexError("ONNXResult only supports index 0")
-        
-        return ONNXResult(outputs, original_shape)
+        return _ONNXResult(outputs, original_shape)
     
     def detect_obstacles(self, 
                         image: np.ndarray, 
-                        hand_landmarks_3d: Optional[List] = None) -> Dict[str, Any]:
+                        hand_landmarks_3d: Optional[List] = None) -> DetectionResult:
         """
         检测图像中的障碍物
         
@@ -463,10 +358,10 @@ class YOLOObstacleDetector:
             return detection_result
             
         except Exception as e:
-            print(f"❌ YOLOv8推理失败: {e}")
+            logger.error(f"YOLOv8 inference failed: {e}")
             return self._get_empty_result()
     
-    def _process_detection_results(self, result, image_shape: Tuple[int, int, int]) -> Dict[str, Any]:
+    def _process_detection_results(self, result, image_shape: Tuple[int, int, int]) -> DetectionResult:
         """
         处理YOLOv8检测结果
         
@@ -515,11 +410,11 @@ class YOLOObstacleDetector:
                 'area': np.sum(mask_binary > 0)
             }
             
-            # 分类为障碍物或手部区域
-            if class_name in self.obstacle_class_names:
+            # 分类为障碍物或手部区域（基于类别ID集合）
+            if class_id in self.obstacle_class_ids:
                 detection_result['obstacles'].append(detection_info)
                 detection_result['obstacle_count'] += 1
-            elif class_name in self.hand_related_class_names:
+            elif class_id in self.hand_class_ids:
                 detection_result['hand_regions'].append(detection_info)
                 detection_result['hand_region_count'] += 1
             
@@ -528,7 +423,7 @@ class YOLOObstacleDetector:
         return detection_result
     
     def _generate_obstacle_mask(self, 
-                               detection_result: Dict[str, Any],
+                               detection_result: DetectionResult,
                                image_shape: Tuple[int, int, int],
                                hand_landmarks_3d: Optional[List] = None) -> np.ndarray:
         """
@@ -605,7 +500,7 @@ class YOLOObstacleDetector:
         
         # 调试信息
         if excluded_pixels > 0:
-            print(f"🔍 手部区域排除: {excluded_pixels} 像素被排除")
+            logger.debug(f"Hand-region exclusion: {excluded_pixels} pixels removed")
         
         return result_mask
     
@@ -658,7 +553,7 @@ class YOLOObstacleDetector:
         
         return mask
     
-    def _get_empty_result(self) -> Dict[str, Any]:
+    def _get_empty_result(self) -> DetectionResult:
         """
         获取空的检测结果
         
@@ -697,64 +592,6 @@ class YOLOObstacleDetector:
             'total_inferences': len(self.inference_times)
         }
     
-    def visualize_detection(self, 
-                           image: np.ndarray, 
-                           detection_result: Dict[str, Any]) -> np.ndarray:
-        """
-        可视化检测结果
-        
-        Args:
-            image: 原始图像
-            detection_result: 检测结果
-            
-        Returns:
-            np.ndarray: 可视化图像
-        """
-        vis_image = image.copy()
-        
-        # 绘制障碍物
-        for obstacle in detection_result['obstacles']:
-            bbox = obstacle['bbox']
-            class_name = obstacle['class_name']
-            confidence = obstacle['confidence']
-            
-            # 绘制边界框
-            x1, y1, x2, y2 = map(int, bbox)
-            cv.rectangle(vis_image, (x1, y1), (x2, y2), (0, 0, 255), 2)
-            
-            # 绘制标签
-            label = f"{class_name}: {confidence:.2f}"
-            cv.putText(vis_image, label, (x1, y1 - 10), 
-                      cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-        
-        # 绘制手部区域
-        for hand_region in detection_result['hand_regions']:
-            bbox = hand_region['bbox']
-            class_name = hand_region['class_name']
-            confidence = hand_region['confidence']
-            
-            # 绘制边界框
-            x1, y1, x2, y2 = map(int, bbox)
-            cv.rectangle(vis_image, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            
-            # 绘制标签
-            label = f"{class_name}: {confidence:.2f}"
-            cv.putText(vis_image, label, (x1, y1 - 10), 
-                      cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-        
-        # 添加统计信息
-        stats_text = [
-            f"Obstacles: {detection_result['obstacle_count']}",
-            f"Hand Regions: {detection_result['hand_region_count']}",
-            f"FPS: {detection_result['fps']:.1f}"
-        ]
-        
-        for i, text in enumerate(stats_text):
-            cv.putText(vis_image, text, (10, 30 + i * 25), 
-                      cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        
-        return vis_image
-    
     def cleanup(self):
         """
         清理资源
@@ -763,71 +600,4 @@ class YOLOObstacleDetector:
             del self.model
             self.model = None
         self.is_initialized = False
-        print("✅ YOLOv8障碍物检测器已清理")
-
-
-def main():
-    """
-    测试YOLOv8障碍物检测器
-    """
-    print("🚀 测试YOLOv8障碍物检测器...")
-    
-    # 创建检测器
-    detector = YOLOObstacleDetector(
-        model_path="yolov8n-seg.pt",
-        confidence_threshold=0.5
-    )
-    
-    if not detector.is_initialized:
-        print("❌ 检测器初始化失败")
-        return
-    
-    # 测试图像（使用摄像头或测试图像）
-    cap = cv.VideoCapture(0)
-    
-    if not cap.isOpened():
-        print("❌ 无法打开摄像头")
-        return
-    
-    try:
-        frame_count = 0
-        while frame_count < 100:  # 测试100帧
-            ret, frame = cap.read()
-            if not ret:
-                break
-            
-            # 检测障碍物
-            detection_result = detector.detect_obstacles(frame)
-            
-            # 可视化结果
-            vis_frame = detector.visualize_detection(frame, detection_result)
-            
-            # 显示障碍物掩膜
-            obstacle_mask = detection_result['obstacle_mask']
-            mask_colored = cv.applyColorMap(obstacle_mask, cv.COLORMAP_JET)
-            
-            # 显示结果
-            cv.imshow('YOLOv8 Obstacle Detection', vis_frame)
-            cv.imshow('Obstacle Mask', mask_colored)
-            
-            frame_count += 1
-            if frame_count % 10 == 0:
-                stats = detector.get_performance_stats()
-                print(f"帧 {frame_count}: {stats['avg_fps']:.1f} FPS")
-            
-            # 按'q'退出
-            if cv.waitKey(1) & 0xFF == ord('q'):
-                break
-    
-    except KeyboardInterrupt:
-        print("\n⏹️ 用户中断")
-    
-    finally:
-        cap.release()
-        cv.destroyAllWindows()
-        detector.cleanup()
-        print("✅ 测试完成")
-
-
-if __name__ == "__main__":
-    main()
+        logger.info("YOLOv8 obstacle detector cleaned up")

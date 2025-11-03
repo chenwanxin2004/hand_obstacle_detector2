@@ -145,17 +145,46 @@ class HandObstacleContactDetector:
         if results.multi_hand_landmarks:
             detection_result['hands_detected'] = True
             
-            # 获取所有手部的3D坐标（同步时间戳）
+            # 获取所有手部的3D坐标（用于生成障碍物掩膜）
             all_hand_landmarks_3d = []
+            height, width = depth_image.shape
             for hand_landmarks in results.multi_hand_landmarks:
-                hand_landmarks_3d = self._get_hand_landmarks_3d(hand_landmarks, depth_image)
-                all_hand_landmarks_3d.extend(hand_landmarks_3d)
+                for landmark in hand_landmarks.landmark:
+                    x = int(landmark.x * width)
+                    y = int(landmark.y * height)
+                    
+                    if 0 <= x < width and 0 <= y < height:
+                        depth = depth_image[y, x]
+                        all_hand_landmarks_3d.append([x, y, depth if depth > 0 else 0])
+                    else:
+                        all_hand_landmarks_3d.append([x, y, 0])
             
             # 生成障碍物掩膜（使用YOLOv8或基础算法）
-            if self.use_yolo_obstacle:
-                obstacle_mask = self._generate_obstacle_mask_with_yolo(color_image, all_hand_landmarks_3d, depth_image)
+            if self.use_yolo_obstacle and self.yolo_obstacle_detector is not None:
+                try:
+                    # 使用YOLOv8检测障碍物
+                    yolo_result = self.yolo_obstacle_detector.detect_obstacles(color_image, all_hand_landmarks_3d)
+                    obstacle_mask = yolo_result.get('obstacle_mask', np.zeros((color_image.shape[0], color_image.shape[1]), dtype=np.uint8))
+                    
+                    # 检查YOLOv8是否检测到足够的障碍物
+                    obstacle_count = yolo_result.get('obstacle_count', 0)
+                    mask_pixels = np.sum(obstacle_mask > 0)
+                    
+                    # 如果YOLOv8检测到的障碍物太少，使用深度备用检测
+                    if obstacle_count < 2 or mask_pixels < 1000:
+                        print(f"🔧 YOLOv8检测不足，启用深度备用检测")
+                        if depth_image is not None:
+                            depth_backup_mask = self._generate_depth_backup_mask(color_image, all_hand_landmarks_3d, depth_image)
+                            obstacle_mask = cv.bitwise_or(obstacle_mask, depth_backup_mask)
+                    
+                    # 存储YOLOv8检测结果用于可视化
+                    self._last_yolo_result = yolo_result
+                except Exception as e:
+                    print(f"❌ YOLOv8障碍物检测失败: {e}")
+                    obstacle_mask = self._generate_depth_backup_mask(color_image, all_hand_landmarks_3d, depth_image)
             else:
-                obstacle_mask = self._generate_obstacle_mask(depth_image, all_hand_landmarks_3d)
+                # 未启用YOLO时，使用深度备用掩膜作为兜底
+                obstacle_mask = self._generate_depth_backup_mask(color_image, all_hand_landmarks_3d, depth_image)
             detection_result['obstacle_mask'] = obstacle_mask
             
             for idx, hand_landmarks in enumerate(results.multi_hand_landmarks):
@@ -208,32 +237,10 @@ class HandObstacleContactDetector:
         detection_result['processing_time'] = time.time() - start_time
         
         return detection_result
-    
-    def _get_hand_landmarks_3d(self, hand_landmarks, depth_image: np.ndarray) -> list:
-        """
-        获取手部关键点的3D坐标
-        """
-        landmarks_3d = []
-        height, width = depth_image.shape
-        
-        for landmark in hand_landmarks.landmark:
-            x = int(landmark.x * width)
-            y = int(landmark.y * height)
-            
-            if 0 <= x < width and 0 <= y < height:
-                depth = depth_image[y, x]
-                if depth > 0:
-                    landmarks_3d.append([x, y, depth])
-                else:
-                    landmarks_3d.append([x, y, 0])
-            else:
-                landmarks_3d.append([x, y, 0])
-        
-        return landmarks_3d
 
     def _detect_single_hand_contact_with_mask(self, hand_landmarks, depth_image: np.ndarray, image_shape: Tuple[int, int, int], obstacle_mask: np.ndarray) -> Dict:
         """
-        使用障碍物掩膜检测单只手的触碰情况（调试版本）
+        使用障碍物掩膜检测单只手的触碰情况
         """
         height, width = image_shape[:2]
         
@@ -255,11 +262,10 @@ class HandObstacleContactDetector:
                 hand_depth = depth_image[y, x]
                 
                 if hand_depth > 0:
-                    # 首先检查手部是否悬空（使用智能检测）
+                    # 首先检查手部是否悬空
                     is_suspended = self._is_hand_suspended(x, y, hand_depth, depth_image)
-                    is_truly_suspended = self._is_hand_truly_suspended(x, y, hand_depth, depth_image)
                     
-                    if is_suspended or is_truly_suspended:
+                    if is_suspended:
                         # 手部悬空，跳过此关键点
                         debug_info = {
                             'landmark_id': idx,
@@ -269,7 +275,7 @@ class HandObstacleContactDetector:
                             'contact_threshold': self.contact_threshold,
                             'warning_threshold': self.warning_threshold,
                             'suspended': True,
-                            'suspension_type': 'truly_suspended' if is_truly_suspended else 'basic_suspended'
+                            'suspension_type': 'suspended'
                         }
                         contact_info['debug_info'].append(debug_info)
                         continue
@@ -316,117 +322,6 @@ class HandObstacleContactDetector:
                                 contact_info['min_distance'] = distance
         
         return contact_info
-
-    def _detect_single_hand_contact(self, hand_landmarks, depth_image: np.ndarray, image_shape: Tuple[int, int, int]) -> Dict:
-        """
-        检测单只手的触碰情况
-        """
-        height, width = image_shape[:2]
-        
-        contact_info = {
-            'contact_detected': False,
-            'warning_detected': False,
-            'contact_points': [],
-            'warning_points': [],
-            'min_distance': float('inf')
-        }
-        
-        # 检查每个关键点
-        for point_name in self.contact_points:
-            if point_name in self.LANDMARK_INDICES:
-                landmark_idx = self.LANDMARK_INDICES[point_name]
-                landmark = hand_landmarks.landmark[landmark_idx]
-                
-                # 转换为像素坐标
-                x = int(landmark.x * width)
-                y = int(landmark.y * height)
-                
-                # 确保坐标在图像范围内
-                if 0 <= x < width and 0 <= y < height:
-                    # 获取该点的深度值
-                    hand_depth = depth_image[y, x]
-                    
-                    if hand_depth > 0:  # 有效的深度值
-                        # 计算与障碍物的距离
-                        distance = self._calculate_obstacle_distance(x, y, hand_depth, depth_image)
-                        
-                        if distance < contact_info['min_distance']:
-                            contact_info['min_distance'] = distance
-                        
-                        # 判断触碰状态
-                        if distance < self.contact_threshold:
-                            contact_info['contact_detected'] = True
-                            contact_info['contact_points'].append({
-                                'point_name': point_name,
-                                'pixel_coords': (x, y),
-                                'depth': hand_depth,
-                                'distance': distance
-                            })
-                        elif distance < self.warning_threshold:
-                            contact_info['warning_detected'] = True
-                            contact_info['warning_points'].append({
-                                'point_name': point_name,
-                                'pixel_coords': (x, y),
-                                'depth': hand_depth,
-                                'distance': distance
-                            })
-        
-        return contact_info
-    
-    def _generate_obstacle_mask(self, depth_image: np.ndarray, hand_landmarks_3d: list) -> np.ndarray:
-        """
-        生成障碍物掩膜（改进版本，带缓存）
-        逻辑：基于深度图阈值识别障碍物区域，排除手部区域
-        改进：动态阈值 + 手部区域膨胀 + 噪声过滤
-        """
-        # 获取手部深度范围
-        hand_depths = [landmark[2] for landmark in hand_landmarks_3d if landmark[2] > 0]
-        if not hand_depths:
-            return np.zeros_like(depth_image, dtype=np.uint8)
-            
-        min_hand_depth = min(hand_depths)
-        max_hand_depth = max(hand_depths)
-        hand_depth_range = max_hand_depth - min_hand_depth
-        
-        # 检查缓存是否有效
-        if (self._cache_valid and 
-            self._last_hand_depths is not None and
-            abs(min_hand_depth - self._last_hand_depths[0]) < 0.01 and
-            abs(max_hand_depth - self._last_hand_depths[1]) < 0.01):
-            return self._obstacle_mask_cache
-        
-        # 动态障碍物深度阈值（基于手部深度范围调整，严格版本）
-        base_threshold = 0.05  # 基础5cm阈值（提高基础阈值）
-        dynamic_threshold = max(base_threshold, hand_depth_range * 0.3)  # 动态调整（提高系数）
-        obstacle_threshold = min(dynamic_threshold, 0.12)  # 最大12cm（提高最大阈值）
-        
-        # 使用numpy向量化操作生成障碍物掩膜
-        valid_depth = depth_image > 0.15  # 提高有效深度阈值，过滤噪声
-        
-        # 改进的障碍物条件：更严格的深度判断，只检测手部前方的物体
-        # 只检测比手部更近的物体（手部前方的障碍物）
-        obstacle_condition = (
-            (depth_image < min_hand_depth - obstacle_threshold) & 
-            (depth_image > 0.1)  # 确保不是背景
-        )
-        
-        # 生成障碍物掩膜
-        obstacle_mask = np.where(valid_depth & obstacle_condition, 255, 0).astype(np.uint8)
-        
-        # 噪声过滤：移除小的噪声区域
-        kernel = np.ones((3,3), np.uint8)
-        obstacle_mask = cv.morphologyEx(obstacle_mask, cv.MORPH_OPEN, kernel)
-        
-        # 手部区域膨胀：确保手部区域被完全排除
-        hand_region_mask = self._create_hand_region_mask(depth_image, hand_landmarks_3d)
-        obstacle_mask = cv.bitwise_and(obstacle_mask, cv.bitwise_not(hand_region_mask))
-        
-        # 更新缓存
-        self._obstacle_mask_cache = obstacle_mask
-        self._last_hand_depths = (min_hand_depth, max_hand_depth)
-        self._cache_valid = True
-        
-        return obstacle_mask
     
     def _create_hand_region_mask(self, depth_image: np.ndarray, hand_landmarks_3d: list) -> np.ndarray:
         """
@@ -463,50 +358,6 @@ class HandObstacleContactDetector:
                 cv.fillPoly(hand_mask, [hull], 255)
         
         return hand_mask
-    
-    def _generate_obstacle_mask_with_yolo(self, color_image: np.ndarray, hand_landmarks_3d: list, depth_image: np.ndarray = None) -> np.ndarray:
-        """
-        使用YOLOv8生成障碍物掩膜（增强版本，包含深度备用检测）
-        
-        Args:
-            color_image: 彩色图像
-            hand_landmarks_3d: 手部关键点3D坐标列表
-            
-        Returns:
-            np.ndarray: 障碍物掩膜
-        """
-        if not self.use_yolo_obstacle or self.yolo_obstacle_detector is None:
-            # 回退到基础算法
-            return np.zeros((color_image.shape[0], color_image.shape[1]), dtype=np.uint8)
-        
-        try:
-            # 使用YOLOv8检测障碍物
-            yolo_result = self.yolo_obstacle_detector.detect_obstacles(color_image, hand_landmarks_3d)
-            
-            # 获取障碍物掩膜
-            obstacle_mask = yolo_result.get('obstacle_mask', np.zeros((color_image.shape[0], color_image.shape[1]), dtype=np.uint8))
-            
-            # 检查YOLOv8是否检测到足够的障碍物
-            obstacle_count = yolo_result.get('obstacle_count', 0)
-            mask_pixels = np.sum(obstacle_mask > 0)
-            
-            # 如果YOLOv8检测到的障碍物太少，使用深度备用检测
-            if obstacle_count < 2 or mask_pixels < 1000:
-                print(f"🔧 YOLOv8检测不足，启用深度备用检测")
-                if depth_image is not None:
-                    depth_backup_mask = self._generate_depth_backup_mask(color_image, hand_landmarks_3d, depth_image)
-                    # 合并YOLOv8和深度检测结果
-                    obstacle_mask = cv.bitwise_or(obstacle_mask, depth_backup_mask)
-            
-            # 存储YOLOv8检测结果用于可视化
-            self._last_yolo_result = yolo_result
-            
-            return obstacle_mask
-            
-        except Exception as e:
-            print(f"❌ YOLOv8障碍物检测失败: {e}")
-            # 回退到基础算法
-            return np.zeros((color_image.shape[0], color_image.shape[1]), dtype=np.uint8)
     
     def _generate_depth_backup_mask(self, color_image: np.ndarray, hand_landmarks_3d: list, depth_image: np.ndarray) -> np.ndarray:
         """
@@ -584,10 +435,10 @@ class HandObstacleContactDetector:
     
     def _is_hand_suspended(self, x: int, y: int, hand_depth: float, depth_image: np.ndarray) -> bool:
         """
-        判断手部是否悬空（严格版本，避免误检背景）
+        判断手部是否悬空（精简版本，保留必要检测）
         """
         height, width = depth_image.shape
-        check_radius = 30  # 增大检查半径，获得更多上下文信息
+        check_radius = 30
         
         # 计算检查区域边界
         x_min = max(0, x - check_radius)
@@ -597,102 +448,50 @@ class HandObstacleContactDetector:
         
         # 提取检查区域的深度
         check_depth = depth_image[y_min:y_max, x_min:x_max]
-        
-        # 找到有效深度点
         valid_depths = check_depth[check_depth > 0.1]
         
+        # 1. 没有有效深度，认为是悬空
         if len(valid_depths) == 0:
-            return True  # 没有有效深度，认为是悬空
-        
-        # 计算手部与周围环境的深度差异
-        depth_diffs = np.abs(valid_depths - hand_depth)
-        
-        # 多级悬空检测（基于人眼视角理解）
-        # 1. 检查是否有足够的点与手部深度差异很大
-        large_diffs = depth_diffs[depth_diffs > 0.25]  # 差异大于25cm（更严格）
-        if len(large_diffs) > len(valid_depths) * 0.8:  # 80%以上的点差异很大
             return True
         
-        # 2. 检查深度分布：如果大部分点都比手部深很多，说明手部悬空
-        # 这模拟人眼看到手部在物体前方的情况
-        deeper_points = valid_depths[valid_depths > hand_depth + 0.20]  # 比手部深20cm以上
-        if len(deeper_points) > len(valid_depths) * 0.7:  # 70%以上的点都比手部深
-            return True
-        
-        # 3. 检查深度变化：如果深度变化很大，可能是复杂背景或视野边缘
-        depth_std = np.std(valid_depths)
-        if depth_std > 0.3:  # 深度标准差大于30cm，可能是复杂背景
-            return True
-        
-        # 4. 检查手部是否在"空中"：如果手部周围大部分区域都没有有效深度
-        # 这模拟手部悬空在空中的情况
-        invalid_depth_ratio = 1.0 - (len(valid_depths) / (check_radius * 2 * check_radius * 2))
-        if invalid_depth_ratio > 0.6:  # 60%以上的区域没有有效深度
-            return True
-        
-        # 5. 检查手部是否在深度图的边缘区域（修正逻辑）
-        # 注意：相机视角中，边缘区域可能是视野边缘的物体，不一定是背景
-        # 只有在边缘区域且深度信息不可靠时才认为是悬空
-        edge_threshold = 0.02  # 2%边缘检测（更保守）
-        is_near_edge = (x < edge_threshold * width or x > (1 - edge_threshold) * width or
-                       y < edge_threshold * height or y > (1 - edge_threshold) * height)
-        
-        if is_near_edge:
-            # 在边缘区域时，需要更严格的验证
-            # 如果边缘区域的深度信息不可靠（变化太大），才认为是悬空
-            if depth_std > 0.4:  # 边缘区域深度变化很大，可能是不可靠的深度信息
-                return True
-        
-        return False
-    
-    def _is_hand_truly_suspended(self, x: int, y: int, hand_depth: float, depth_image: np.ndarray) -> bool:
-        """
-        基于人眼视角的智能悬空检测
-        模拟人眼判断手部是否真正悬空在空中的逻辑
-        """
-        height, width = depth_image.shape
-        
-        # 检查手部周围的"支撑"情况
-        # 人眼会观察手部下方和周围是否有支撑物
-        
-        # 1. 检查手部下方区域（模拟重力方向）
-        below_radius = 40
-        below_y = min(height, y + below_radius)
+        # 2. 先检查是否有支撑或连接（优先判断非悬空情况）
+        # 2.1 检查手部下方是否有支撑物
+        below_y = min(height, y + 40)
         below_x_min = max(0, x - 20)
         below_x_max = min(width, x + 20)
         
         if below_y < height:
             below_region = depth_image[y:below_y, below_x_min:below_x_max]
             below_depths = below_region[below_region > 0.1]
-            
             if len(below_depths) > 0:
-                # 检查下方是否有支撑物（比手部更近的物体）
-                support_depths = below_depths[below_depths < hand_depth - 0.05]  # 比手部近5cm以上
-                if len(support_depths) > len(below_depths) * 0.3:  # 30%以上的下方区域有支撑
+                support_depths = below_depths[below_depths < hand_depth - 0.05]
+                if len(support_depths) > len(below_depths) * 0.3:
                     return False  # 有支撑，不是悬空
         
-        # 2. 检查手部周围的"连接"情况
-        # 人眼会观察手部是否与周围物体有连接
+        # 2.2 检查手部周围是否有相似深度的物体（可能的连接）
         connection_radius = 25
-        x_min = max(0, x - connection_radius)
-        x_max = min(width, x + connection_radius + 1)
-        y_min = max(0, y - connection_radius)
-        y_max = min(height, y + connection_radius + 1)
+        conn_x_min = max(0, x - connection_radius)
+        conn_x_max = min(width, x + connection_radius + 1)
+        conn_y_min = max(0, y - connection_radius)
+        conn_y_max = min(height, y + connection_radius + 1)
         
-        connection_region = depth_image[y_min:y_max, x_min:x_max]
+        connection_region = depth_image[conn_y_min:conn_y_max, conn_x_min:conn_x_max]
         connection_depths = connection_region[connection_region > 0.1]
         
         if len(connection_depths) > 0:
-            # 检查是否有与手部深度相近的物体（可能的连接）
-            similar_depths = connection_depths[np.abs(connection_depths - hand_depth) < 0.08]  # 8cm内
-            if len(similar_depths) > len(connection_depths) * 0.4:  # 40%以上的区域有相似深度的物体
+            similar_depths = connection_depths[np.abs(connection_depths - hand_depth) < 0.08]
+            if len(similar_depths) > len(connection_depths) * 0.4:
                 return False  # 有连接，不是悬空
         
-        # 3. 检查手部是否在"空中"（周围大部分区域没有有效深度）
-        total_pixels = (connection_radius * 2) ** 2
-        valid_pixels = len(connection_depths)
-        if valid_pixels < total_pixels * 0.3:  # 70%以上的区域没有有效深度
-            return True  # 在"空中"
+        # 3. 判断悬空：如果大部分周围点都比手部深很多，说明手部悬空在前方
+        deeper_points = valid_depths[valid_depths > hand_depth + 0.20]
+        if len(deeper_points) > len(valid_depths) * 0.7:
+            return True
+        
+        # 4. 检查深度信息可靠性：如果深度变化太大，可能是不可靠的深度信息
+        depth_std = np.std(valid_depths)
+        if depth_std > 0.3:
+            return True
         
         return False
     
@@ -1029,8 +828,8 @@ def main():
     """
     print("🚀 启动手部触碰障碍物检测系统...")
     
-    # 初始化相机（自动选择RealSense或普通摄像头）
-    camera = create_camera("auto")
+    # 初始化相机（仅RealSense）
+    camera = create_camera()
    
     # 初始化检测器（使用量化模型）
     detector = HandObstacleContactDetector(
@@ -1050,6 +849,13 @@ def main():
     frame_count = 0
     show_depth = True
     is_realsense = hasattr(camera, 'create_depth_visualization')
+    
+    # 设置窗口位置
+    cv.namedWindow('Hand Obstacle Contact Detection', cv.WINDOW_NORMAL)
+    cv.moveWindow('Hand Obstacle Contact Detection', 100, 100)
+    if is_realsense:
+        cv.namedWindow('Depth Map', cv.WINDOW_NORMAL)
+        cv.moveWindow('Depth Map', 800, 100)
     
     try:
         while True:
@@ -1130,11 +936,7 @@ def main():
                             # 显示前3个关键点的详细信息
                             for debug in hand_info['debug_info'][:3]:
                                 if debug.get('suspended', False):
-                                    suspension_type = debug.get('suspension_type', 'basic_suspended')
-                                    if suspension_type == 'truly_suspended':
-                                        status = "真正悬空"
-                                    else:
-                                        status = "基础悬空"
+                                    status = "悬空"
                                 else:
                                     status = "正常"
                                     

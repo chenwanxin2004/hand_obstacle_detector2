@@ -1,22 +1,25 @@
-# 手部检测和YOLO目标检测系统
+# 手部触碰障碍物检测系统
 
-基于MediaPipe和YOLOv8的实时手部检测和YOLO目标检测系统，支持Intel RealSense D435摄像头。
+基于MediaPipe和YOLOv8的实时手部触碰障碍物检测系统，支持Intel RealSense深度摄像头。该系统能够实时检测手部与障碍物的距离，并在手部接近或触碰障碍物时发出警告。
 
 ## 🚀 功能特性
 
-- **实时手部检测**: 使用MediaPipe进行高精度手部关键点检测
-- **YOLO目标检测**: 集成YOLOv8模型进行实时目标检测
-- **Intel RealSense支持**: 支持D435深度摄像头，提供彩色和深度图像
-- **双摄像头模式**: 支持默认摄像头和RealSense摄像头
-- **帧保存功能**: 支持自动和手动保存检测帧
-- **实时显示**: 实时显示检测结果和深度图
+- **实时手部检测**: 使用MediaPipe进行高精度手部21个关键点检测
+- **YOLOv8语义分割**: 使用YOLOv8语义分割模型进行障碍物检测和分割
+- **深度融合检测**: 结合深度图信息和YOLOv8语义分割结果，实现精确的障碍物检测
+- **触碰检测**: 检测手部关键点与障碍物的距离，判断触碰和接近状态
+- **智能悬空检测**: 自动识别手部悬空状态，避免误检背景
+- **Intel RealSense支持**: 支持D435深度摄像头，提供实时彩色和深度图像
+- **实时可视化**: 双窗口显示检测结果和深度图，支持触碰点和警告点标注
+- **自适应阈值**: 根据环境自动调整检测阈值，提高检测准确性
 
 ## 📋 系统要求
 
 - Python 3.8+
 - OpenCV 4.8+
 - MediaPipe 0.10+
-- Intel RealSense SDK 2.0+ (可选，用于RealSense摄像头)
+- Intel RealSense SDK 2.0+ (必需，用于深度检测)
+- PyTorch 或 ONNX Runtime (用于YOLOv8模型推理)
 
 ## 🛠️ 安装
 
@@ -35,76 +38,82 @@ uv sync
 pip install -r requirements.txt
 ```
 
-### 3. 下载YOLO模型
-确保YOLO模型文件位于 `src/project_name/yolov8n.pt`
+### 3. 准备YOLO模型
+确保YOLOv8语义分割模型文件位于以下位置之一：
+- `src/yolov8n-seg.pt` (PyTorch模型)
+- `src/yolov8n-seg.onnx` (ONNX模型，推荐)
+- `src/quantized_models/yolov8n-seg_fp16/` (量化模型)
 
 ## 📹 使用方法
 
-### 默认摄像头模式
+### 启动程序
 ```bash
-# 使用默认摄像头
-python -m src.project_name.main
-
-# 指定摄像头ID
-python -m src.project_name.main --camera-id 1
-
-# 启用自动保存帧
-python -m src.project_name.main --save-frames
+# 直接运行
+python src/main.py
 ```
 
-### Intel RealSense D435模式
-```bash
-# 使用RealSense摄像头
-python -m src.project_name.main --camera-type realsense
+程序会自动：
+1. 初始化Intel RealSense摄像头
+2. 加载YOLOv8障碍物检测模型
+3. 启动实时检测窗口
 
-# 启用自动保存帧
-python -m src.project_name.main --camera-type realsense --save-frames
-```
+### 窗口说明
 
-### 命令行参数
-
-| 参数 | 说明 | 默认值 |
-|------|------|--------|
-| `--camera-type` | 摄像头类型: `default` 或 `realsense` | `default` |
-| `--camera-id` | 默认摄像头ID | `0` |
-| `--yolo-model` | YOLO模型文件路径 | `src/project_name/yolov8n.pt` |
-| `--save-frames` | 是否自动保存检测帧 | `False` |
+程序会打开两个窗口：
+- **主窗口** (Hand Obstacle Contact Detection): 显示手部检测和触碰检测结果
+  - 红色圆点: 触碰检测点 (HIT!)
+  - 黄色圆点: 接近警告点 (NEAR)
+  - 状态栏: 显示当前安全状态 (SAFE/WARNING/COLLISION)
+  
+- **深度图窗口** (Depth Map): 显示深度图和障碍物掩膜
+  - 彩色深度图
+  - 障碍物掩膜叠加显示
+  - 触碰点和警告点的深度标注
 
 ## 🎮 控制说明
 
 - **按 'q'**: 退出程序
-- **按 's'**: 手动保存当前帧
-- **自动保存**: 如果启用，每30帧自动保存一次
+- **按 's'**: 保存当前检测帧
+- **按 'd'**: 切换深度图窗口显示/隐藏
+
+## 📊 检测参数
+
+### 默认阈值
+- **触碰阈值**: 3cm (0.03m) - 手部与障碍物距离小于此值判定为触碰
+- **警告阈值**: 6cm (0.06m) - 手部与障碍物距离小于此值但大于触碰阈值时发出警告
+
+### 自适应调整
+系统会根据环境自动调整阈值，避免误检和漏检。
+
+## 🔧 配置选项
+
+### 修改检测参数
+在 `src/main.py` 的 `main()` 函数中修改：
+
+```python
+detector = HandObstacleContactDetector(
+    contact_threshold=0.03,      # 触碰阈值（米）
+    warning_threshold=0.06,       # 警告阈值（米）
+    use_yolo_obstacle=True,       # 是否使用YOLOv8
+    yolo_model_path="src/yolov8n-seg.onnx"  # 模型路径
+)
+```
+
+### YOLOv8模型配置
+在 `yolo_obstacle_detector.py` 中可以配置：
+- 置信度阈值
+- 量化类型 (fp16/int8)
+- 模型路径
 
 ## 📁 输出文件
 
-### 默认摄像头模式
-- `auto_capture_XXXXXX.jpg`: 自动保存的帧
-- `manual_capture_XXXXXXXXX.jpg`: 手动保存的帧
-
-### RealSense模式
-- `realsense_color_XXXXXX.jpg`: 彩色图像帧
-- `realsense_depth_XXXXXX.jpg`: 深度图像帧
-- `realsense_manual_color_XXXXXXXXX.jpg`: 手动保存的彩色帧
-- `realsense_manual_depth_XXXXXXXXX.jpg`: 手动保存的深度帧
-
-## 🔧 配置
-
-### 环境变量
-创建 `.env` 文件：
-```bash
-# 调试模式
-DEBUG=False
-
-# 日志级别
-LOG_LEVEL=INFO
-```
+- `contact_detection_frame_XXXXXX.jpg`: 手动保存的检测帧
 
 ## 📊 性能优化
 
-- 调整MediaPipe检测参数以获得最佳性能
-- 根据硬件配置调整YOLO模型大小
-- 使用GPU加速（如果可用）
+- **量化模型**: 使用FP16量化后的ONNX模型可显著提升推理速度
+- **自适应阈值**: 自动调整检测阈值，平衡检测精度和误检率
+- **缓存机制**: 系统会缓存障碍物掩膜，减少重复计算
 
 ## 🐛 故障排除
 
@@ -112,19 +121,35 @@ LOG_LEVEL=INFO
 1. 确保安装了Intel RealSense SDK 2.0
 2. 检查USB连接和驱动安装
 3. 运行 `rs-enumerate-devices` 检查设备状态
+4. 确保摄像头固件为最新版本
 
 ### 手部检测不准确
-1. 确保光线充足
-2. 调整手部与摄像头的距离
-3. 检查MediaPipe版本兼容性
+1. 确保光线充足，避免过暗或过亮环境
+2. 调整手部与摄像头的距离（推荐40-80cm）
+3. 确保手部在摄像头视野范围内
+
+### YOLOv8检测失败
+1. 检查模型文件路径是否正确
+2. 确认模型文件格式 (`.pt` 或 `.onnx`)
+3. 检查ONNX Runtime是否正确安装
+
+### 深度检测不准确
+1. 确保RealSense摄像头正确连接
+2. 检查深度图质量，避免强光或反光表面
+3. 调整摄像头位置，确保深度检测范围
 
 ## 📚 技术栈
 
-- **手部检测**: MediaPipe Hands
-- **目标检测**: YOLOv8
+- **手部检测**: MediaPipe Hands (21个关键点)
+- **障碍物检测**: YOLOv8 Segmentation (实例分割)
+- **深度感知**: Intel RealSense D435
 - **计算机视觉**: OpenCV
-- **深度感知**: Intel RealSense SDK
-- **深度学习**: PyTorch
+- **深度学习**: PyTorch / ONNX Runtime
+- **量化**: FP16/INT8量化支持
+
+## 📖 相关文档
+
+- [函数调用链说明](docs/FUNCTION_CALL_CHAIN.md) - 详细的函数调用关系说明
 
 ## 🤝 贡献
 
@@ -133,86 +158,3 @@ LOG_LEVEL=INFO
 ## 📄 许可证
 
 本项目采用MIT许可证。
-# 常见的COCO类别示例
-COCO_CLASSES = {
-    0: 'person',           # 人
-    1: 'bicycle',          # 自行车
-    2: 'car',              # 汽车
-    3: 'motorcycle',       # 摩托车
-    4: 'airplane',         # 飞机
-    5: 'bus',              # 公交车
-    6: 'train',            # 火车
-    7: 'truck',            # 卡车
-    8: 'boat',             # 船
-    9: 'traffic light',    # 红绿灯
-    10: 'fire hydrant',    # 消防栓
-    11: 'stop sign',       # 停止标志
-    12: 'parking meter',   # 停车计时器
-    13: 'bench',           # 长凳
-    14: 'bird',            # 鸟
-    15: 'cat',             # 猫
-    16: 'dog',             # 狗
-    17: 'horse',           # 马
-    18: 'sheep',           # 羊
-    19: 'cow',             # 牛
-    20: 'elephant',        # 大象
-    21: 'bear',            # 熊
-    22: 'zebra',           # 斑马
-    23: 'giraffe',         # 长颈鹿
-    24: 'backpack',        # 背包
-    25: 'umbrella',        # 雨伞
-    26: 'handbag',         # 手提包
-    27: 'tie',             # 领带
-    28: 'suitcase',        # 行李箱
-    29: 'frisbee',         # 飞盘
-    30: 'skis',            # 滑雪板
-    31: 'snowboard',       # 滑雪板
-    32: 'sports ball',     # 运动球
-    33: 'kite',            # 风筝
-    34: 'baseball bat',    # 棒球棒
-    35: 'baseball glove',  # 棒球手套
-    36: 'skateboard',      # 滑板
-    37: 'surfboard',       # 冲浪板
-    38: 'tennis racket',   # 网球拍
-    39: 'bottle',          # 瓶子
-    40: 'wine glass',      # 酒杯
-    41: 'cup',             # 杯子
-    42: 'fork',            # 叉子
-    43: 'knife',           # 刀子
-    44: 'spoon',           # 勺子
-    45: 'bowl',            # 碗
-    46: 'banana',          # 香蕉
-    47: 'apple',           # 苹果
-    48: 'sandwich',        # 三明治
-    49: 'orange',          # 橙子
-    50: 'broccoli',        # 西兰花
-    51: 'carrot',          # 胡萝卜
-    52: 'hot dog',         # 热狗
-    53: 'pizza',           # 披萨
-    54: 'donut',           # 甜甜圈
-    55: 'cake',            # 蛋糕
-    56: 'chair',            # 椅子
-    57: 'couch',            # 沙发
-    58: 'potted plant',    # 盆栽植物
-    59: 'bed',              # 床
-    60: 'dining table',    # 餐桌
-    61: 'toilet',           # 马桶
-    62: 'tv',               # 电视
-    63: 'laptop',           # 笔记本电脑
-    64: 'mouse',            # 鼠标
-    65: 'remote',           # 遥控器
-    66: 'keyboard',         # 键盘
-    67: 'cell phone',       # 手机
-    68: 'microwave',        # 微波炉
-    69: 'oven',             # 烤箱
-    70: 'toaster',          # 烤面包机
-    71: 'sink',             # 水槽
-    72: 'refrigerator',     # 冰箱
-    73: 'book',             # 书
-    74: 'clock',            # 时钟
-    75: 'vase',             # 花瓶
-    76: 'scissors',         # 剪刀
-    77: 'teddy bear',       # 泰迪熊
-    78: 'hair drier',       # 吹风机
-    79: 'toothbrush'        # 牙刷
-}
